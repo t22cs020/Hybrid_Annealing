@@ -1,20 +1,34 @@
-
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 @dataclass
 class Solution:
     x: np.ndarray
-    energy_all: float = 0
-    energy_obj: float = 0
-    energy_constraint: float = 0
-    constraint: bool = True
+    qubo: np.ndarray = None
+    const: float = 0
+    N: int = None  # 問題サイズ
+    energy_all: float = field(init=False)
+    energy_obj: float = field(default=0)
+    energy_constraint: float = field(default=0)
+    constraint: bool = field(init=False)
 
-    
-    @classmethod
-    def energy(cls, qubo: np.ndarray, x: np.ndarray, const=0) -> float:
-        return float(np.dot(np.dot(x, qubo), x) + const)
+    def __post_init__(self):
+        self.x = np.asarray(self.x, dtype=int).flatten()
+        if self.qubo is not None:
+            xTx = np.dot(self.x, self.qubo @ self.x)
+            self.energy_obj = float(xTx)
+            self.energy_constraint = float(self.const)
+            self.energy_all = self.energy_obj + self.energy_constraint
+        else:
+            self.energy_all = float("inf")
+            self.energy_obj = float("inf")
+            self.energy_constraint = float("inf")
+        if self.N is not None:
+            self.constraint = self.is_one_hot_assignment(self.x, self.N)
+        else:
+            self.constraint = None
 
-    @classmethod
-    def check_constraint(cls, qubo: np.ndarray, x: np.ndarray, const=0) -> bool:
-        return cls.energy(qubo, x, const) == 0
+    @staticmethod
+    def is_one_hot_assignment(x: np.ndarray, N: int) -> bool:
+        x = np.asarray(x).reshape(N, N)
+        return np.all(np.sum(x, axis=1) == 1) and np.all(np.sum(x, axis=0) == 1)

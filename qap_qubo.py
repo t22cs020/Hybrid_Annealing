@@ -50,22 +50,24 @@ def create_qap_bqm(filepath, penalty=1000):
             quadratic[pair] = quadratic.get(pair, 0) + coeff
 
     # --- QUBO行列生成 ---
-    qubo_matrix = np.zeros((N * N, N * N))
-    for (u, v), coeff in quadratic.items():
-        if u in name_to_index and v in name_to_index:
-            i1, j1 = name_to_index[u]
-            i2, j2 = name_to_index[v]
-            idx_u = i1 * N + j1
-            idx_v = i2 * N + j2
-            qubo_matrix[idx_u, idx_v] += coeff
-            if idx_u != idx_v:
-                qubo_matrix[idx_v, idx_u] += coeff
+    qubo_matrix = np.zeros((n*n, n*n))
+    for i in range(n):
+        for j in range(n):
+            for k in range(n):
+                for l in range(n):
+                    qubo_matrix[i*n + k, j*n + l] += flow[i, j] * dist[k, l]
 
-    for u, coeff in linear.items():
-        if u in name_to_index:
-            i, j = name_to_index[u]
-            idx = i * N + j
-            qubo_matrix[idx, idx] += coeff
+    for i in range(n):
+        for k in range(n):
+            qubo_matrix[i*n + k, i*n + k] += -2 * penalty_weight
+            for l in range(k + 1, n):
+                qubo_matrix[i*n + k, i*n + l] += 2 * penalty_weight
+
+    for k in range(n):
+        for i in range(n):
+            qubo_matrix[i*n + k, i*n + k] += -2 * penalty_weight
+            for j in range(i + 1, n):
+                qubo_matrix[i*n + k, j*n + k] += 2 * penalty_weight
 
     # --- BQM作成 ---
     bqm = dimod.BinaryQuadraticModel(linear, quadratic, 0.0, dimod.BINARY)
