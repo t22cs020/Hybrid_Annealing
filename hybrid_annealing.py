@@ -1,76 +1,102 @@
-
 import random
 import numpy as np
 from solution import Solution
+from amplify import solve, FixstarsClient, Model, VariableGenerator
+from dwave.samplers import TabuSampler
+from datetime import timedelta
+
 
 class HybridAnnealing:
-    def __init__(self, qubo_obj, qubo_constraint, const_constraint, num_spin,
-                 N_I=20, N_E=10, N_S=10, sub_qubo_size=5):
-        self.pool = []
-        self.N_I = N_I
-        self.N_E = N_E
-        self.N_S = N_S
-        self.sub_qubo_size = sub_qubo_size
-        self.num_spin = num_spin
-        self.qubo_obj = qubo_obj
-        self.qubo_constraint = qubo_constraint
+    def __init__(self, bqm, qubo_matrix, const_constraint, num_spin,
+                 N_I, N_E, N_S, sub_qubo_size, spin, client, name_to_index):
+        self.bqm = bqm # model（QUBO式）
+        self.qubo_matrix = qubo_matrix
         self.const_constraint = const_constraint
-        self._initialize_pool()
+        self.num_spin = num_spin # QUBO size
+        self.N_I = N_I # solution instances
+        self.N_E = N_E # num of subQUBO
+        self.N_S = N_S # num of select solution instamces(N_S < N_I )
+        self.client = client
+        self.sub_qubo_size = sub_qubo_size # subQUBO size 
+        self.spin = spin # amplify spins
+        self.name_to_index = name_to_index
+        self.pool = self._initialize_pool() # solution instances pool(N_I)
+         
+        
 
+     # プールを初期化
     def _initialize_pool(self):
+        pool = []
+        N = int(np.sqrt(self.num_spin))
         for _ in range(self.N_I):
-            x = np.random.randint(0, 2, self.num_spin)
-            energy_obj = Solution.energy(self.qubo_obj, x)
-            energy_constraint = Solution.energy(self.qubo_constraint, x, self.const_constraint)
-            self.pool.append(Solution(
-                x=x,
-                energy_all=energy_obj + energy_constraint,
-                energy_obj=energy_obj,
-                energy_constraint=energy_constraint,
-                constraint=Solution.check_constraint(self.qubo_constraint, x, self.const_constraint)
-            ))
-        self.pool.sort(key=lambda sol: sol.energy_all)
+            # one-hotな割当（パーミュテーション行列）を生成
+            perm = np.random.permutation(N)
+            x_vec = np.zeros((N, N), dtype=int)
+            x_vec[np.arange(N), perm] = 1
+            x_vec = x_vec.flatten()
+            s = Solution(x_vec, qubo=self.qubo_matrix, const=self.const_constraint, N=N)
+            pool.append(s)
+        return pool
 
+    # Amplify モデルと変数 q を取得して，解いた変数を返す   
+    def _evaluate(self, model, spin):
+        result = solve(model, self.client)
+        q_values = spin.evaluate(result.best.values)
+        return q_values
+    
+    # d-wave タブーサーチ
+    def _tabu_search(self, bqm):
+        sampler = TabuSampler()
+        sampleset = sampler.sample(bqm, num_reads=100)
+        return sampleset
+
+    # メイン
     def run(self):
-        x_best = self.pool[0]
-        for _ in range(1):
-            for sol in self.pool:
-                x = np.random.randint(0, 2, self.num_spin)
-                sol.x = x
-                sol.energy_obj = Solution.energy(self.qubo_obj, x)
-                sol.energy_constraint = Solution.energy(self.qubo_constraint, x, self.const_constraint)
-                sol.energy_all = sol.energy_obj + sol.energy_constraint
-                sol.constraint = Solution.check_constraint(self.qubo_constraint, x, self.const_constraint)
+        # 一旦，１
+        # 本来は，プール内の平均ハミング距離で判定
+        for epoch in range(1):
+            for i in range(self.N_I):
+                solution_tmp = Solution(self.num_spin)
+                solution_tmp.x = np.copy(self.pool[i].x)
 
-            for _ in range(self.N_E):
-                n_s_pool = random.sample(self.pool, self.N_S)
-                vars_of_x = np.array([sum(sol.x[j] for sol in n_s_pool) - self.N_S / 2 for j in range(self.num_spin)])
-                solution_tmp = random.choice(n_s_pool)
-                extracted_idx = np.argsort(vars_of_x)[:self.sub_qubo_size]
-                non_extracted_idx = np.argsort(vars_of_x)[self.sub_qubo_size:]
+            # ランダムにサブQUBO選択
+            extracted_idx = sorted(random.sample(range(self.num_spin), self.sub_qubo_size))
+            non_extracted_idx = sorted(list(set(range(self.num_spin)) - set(extracted_idx)))
 
-                subqubo_obj = self.qubo_obj[np.ix_(extracted_idx, extracted_idx)]
-                subqubo_constraint = self.qubo_constraint[np.ix_(extracted_idx, extracted_idx)]
+            # サブQUBO作成
+            subqubo_obj = self.qubo_obj[np.ix_(extracted_idx, extracted_idx)]
+            for idx_i, val_i in enumerate(extracted_idx):
+                subqubo_obj[idx_i, idx_i] += sum(self.qubo_obj[val_i, j] * solution_tmp.x[j]
+                                                for j in non_extracted_idx)
 
-                for idx_i, val_i in enumerate(extracted_idx):
-                    subqubo_obj[idx_i, idx_i] += sum(self.qubo_obj[val_i, j] * solution_tmp.x[j] for j in non_extracted_idx)
-                    subqubo_constraint[idx_i, idx_i] += sum(self.qubo_constraint[val_i, j] * solution_tmp.x[j] for j in non_extracted_idx)
+            subqubo_constraint = self.qubo_matrix[np.ix_(extracted_idx, extracted_idx)]
+            
+            for idx_i, val_i in enumerate(extracted_idx):
+                subqubo_constraint[idx_i, idx_i] += sum(self.qubo_matrix[val_i, j] * solution_tmp.x[j]
+                                                        for j in non_extracted_idx)
 
-                x_sub = np.random.randint(0, 2, self.sub_qubo_size)
-                for idx, val in enumerate(extracted_idx):
-                    solution_tmp.x[val] = x_sub[idx]
+                const = self.const_constraint - sum(sum(self.qubo_matrix[i, j] * solution_tmp.x[i] * solution_tmp.x[j]
+                                                        for j in non_extracted_idx) for i in non_extracted_idx)
 
-                energy_obj = Solution.energy(self.qubo_obj, solution_tmp.x)
-                energy_constraint = Solution.energy(self.qubo_constraint, solution_tmp.x, self.const_constraint)
-                solution_tmp.energy_all = energy_obj + energy_constraint
-                solution_tmp.energy_obj = energy_obj
-                solution_tmp.energy_constraint = energy_constraint
-                solution_tmp.constraint = Solution.check_constraint(self.qubo_constraint, solution_tmp.x, self.const_constraint)
+                # Amplify用のModelを構築
+                gen = VariableGenerator()
+                matrix = gen.matrix("Binary", self.sub_qubo_size, self.sub_qubo_size)
+                q = matrix.variable_array
+                sub_model = sum(subqubo_obj[i, j] * q[i] * q[j] for i in range(self.sub_qubo_size) for j in range(self.sub_qubo_size))
+                sub_model += (sum(subqubo_constraint[i, j] * q[i] * q[j] for i in range(self.sub_qubo_size) for j in range(self.sub_qubo_size)) - const) ** 2
 
-                self.pool.append(solution_tmp)
+                result = self.solve(sub_model, self.client)
+                if result.status.name != "SUCCESS":
+                    continue
 
-            self.pool.sort(key=lambda sol: sol.energy_all)
-            x_best = self.pool[0]
-            self.pool = self.pool[:self.N_I]
+                values = result[0].values
+                for idx, var in enumerate(q):
+                    bit = values.get(var, 0)
+                    solution_tmp.x[extracted_idx[idx]] = bit
 
-        return self.pool, x_best
+                solution_tmp.energy = self._evaluate(solution_tmp.x)
+                if solution_tmp.energy < self.pool[i].energy:
+                    self.pool[i] = solution_tmp
+
+        best_solution = min(self.pool, key=lambda s: s.energy)
+        return best_solution.x, best_solution.energy
