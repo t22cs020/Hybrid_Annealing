@@ -7,11 +7,13 @@ from datetime import timedelta
 
 
 class HybridAnnealing:
-    def __init__(self, bqm, qubo_matrix, const_constraint, num_spin,
+    def __init__(self, bqm, qubo_matrix, qubo_obj, qubo_constraints, const_constraint, num_spin,
                  N_I, N_E, N_S, sub_qubo_size, spin, client, name_to_index):
         self.bqm = bqm # model（QUBO式）
-        self.qubo_matrix = qubo_matrix
-        self.const_constraint = const_constraint
+        self.qubo_matrix = qubo_matrix # QUBO行列
+        self.qubo_obj = qubo_obj # QUBO行列（コスト項）
+        self.qubo_constraints = qubo_constraints # QUBO行列（制約項）
+        self.const_constraint = const_constraint # 制約定数
         self.num_spin = num_spin # QUBO size
         self.N_I = N_I # solution instances
         self.N_E = N_E # num of subQUBO
@@ -24,18 +26,31 @@ class HybridAnnealing:
          
         
 
-     # プールを初期化
+    # プール初期化（Tabuサーチを使う版）
     def _initialize_pool(self):
+        sampler = TabuSampler()
         pool = []
-        N = int(np.sqrt(self.num_spin))
-        for _ in range(self.N_I):
-            # one-hotな割当（パーミュテーション行列）を生成
-            perm = np.random.permutation(N)
-            x_vec = np.zeros((N, N), dtype=int)
-            x_vec[np.arange(N), perm] = 1
-            x_vec = x_vec.flatten()
-            s = Solution(x_vec, qubo=self.qubo_matrix, const=self.const_constraint, N=N)
-            pool.append(s)
+        # Tabuサーチで連続N_I回サンプリング
+        sampleset = sampler.sample(self.bqm, num_reads= self.N_I)
+        # サンプルセットから N_I 個のサンプルを取得
+        for sample in sampleset.samples():
+            # Ocean形式 {'x_{i}_{j}': 0/1, ...} から1次元配列xに変換 (変数ソート順を合わせる)
+            # name_to_index: {'x_{i}_{j}': (i, j)}
+            # num_spin = N*N
+            x = np.zeros(len(self.qubo_obj), dtype=int)
+            for idx, var in enumerate(sorted(sample.keys())):
+                x[idx] = sample[var]
+            energy_obj = Solution.energy(self.qubo_obj, x)
+            energy_constraint = Solution.energy(qubo = self.qubo_matrix, x=x, const = self.const_constraint)
+            pool.append(
+                Solution(
+                    x=x,
+                    energy_all=energy_obj + energy_constraint,
+                    energy_obj=energy_obj,
+                    energy_constraint=energy_constraint,
+                    constraint=Solution.check_constraint(qubo = self.qubo_matrix, x=x, const=self.const_constraint)
+                )
+            )
         return pool
 
     # Amplify モデルと変数 q を取得して，解いた変数を返す   

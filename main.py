@@ -9,13 +9,13 @@ from datetime import timedelta
 
 
 if __name__ == "__main__":
-    filepath = "QAPLIB/tai20a.dat.txt"
+    filepath = "QAPLIB/tai12a.dat.txt"
     
     client = FixstarsClient()
     client.token = "AE/eTNJSueTP0TJJa9NsloAvTMyxjQIoJ2X"
     client.parameters.timeout = timedelta(milliseconds = 100)
     
-    bqm, q, model, N, constraints, qubo_matrix, name_to_index = create_qap_bqm(filepath)
+    bqm, q, model, N, qubo_matrix, qubo_constraints, qubo_obj, name_to_index = create_qap_bqm(filepath)
     
     # bqm {('{name: q_{i,j}, id: 398, type: Binary}', )}
     
@@ -67,7 +67,9 @@ if __name__ == "__main__":
     ha = HybridAnnealing(
         bqm = bqm, # QUBO (BQM形式)
         qubo_matrix = qubo_matrix, # QUBO行列
-        const_constraint = np.sum(qubo_matrix), # 定数項
+        qubo_obj = qubo_obj,
+        qubo_constraints = qubo_constraints,
+        const_constraint = np.sum(qubo_constraints), # 定数項
         num_spin = len(model.variables), # QUBOのサイズ (N * N)
         N_I = 20, # 解インスタンスの数
         N_E = 10, # サブQUBO構築数
@@ -78,8 +80,8 @@ if __name__ == "__main__":
         name_to_index = name_to_index
     )
     
-    #pool = ha._initialize_pool()
-    #print(pool)
+    pool = ha._initialize_pool()
+    print(pool)
     #final_pool, best_solution = ha.run()
     #print("Best Solution:", best_solution)
     

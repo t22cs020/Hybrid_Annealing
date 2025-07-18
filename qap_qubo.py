@@ -51,29 +51,39 @@ def create_qap_bqm(filepath, penalty=1000):
 
     # --- QUBO行列生成 ---
     qubo_matrix = np.zeros((n*n, n*n))
+    qubo_obj = np.zeros((n*n, n*n))
     for i in range(n):
         for j in range(n):
             for k in range(n):
                 for l in range(n):
+                    qubo_obj[i*n + k, j*n + l] += flow[i, j] * dist[k, l]
                     qubo_matrix[i*n + k, j*n + l] += flow[i, j] * dist[k, l]
 
+    qubo_constraints = np.zeros((n*n, n*n))
+    # 施設ごとの one-hot
     for i in range(n):
         for k in range(n):
+            qubo_constraints[i*n + k, i*n + k] += -2 * penalty_weight
             qubo_matrix[i*n + k, i*n + k] += -2 * penalty_weight
             for l in range(k + 1, n):
+                qubo_constraints[i*n + k, i*n + l] += 2 * penalty_weight
                 qubo_matrix[i*n + k, i*n + l] += 2 * penalty_weight
 
+    # 場所ごとの one-hot
     for k in range(n):
         for i in range(n):
+            qubo_constraints[i*n + k, i*n + k] += -2 * penalty_weight
             qubo_matrix[i*n + k, i*n + k] += -2 * penalty_weight
             for j in range(i + 1, n):
+                qubo_constraints[i*n + k, j*n + k] += 2 * penalty_weight
                 qubo_matrix[i*n + k, j*n + k] += 2 * penalty_weight
 
     # --- BQM作成 ---
     bqm = dimod.BinaryQuadraticModel(linear, quadratic, 0.0, dimod.BINARY)
 
-    print("flow",flow)
-    print("dist",dist)
-    print("qubo_matrix", qubo_matrix)
+    # デバック用
+    #print("flow",flow)
+    #print("dist",dist)
+    #print("qubo_matrix", qubo_matrix)
     
-    return bqm, q, model, N, constraints, qubo_matrix, name_to_index
+    return bqm, q, model, N, qubo_matrix, qubo_constraints, qubo_obj, name_to_index
