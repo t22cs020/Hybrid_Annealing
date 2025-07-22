@@ -8,7 +8,7 @@ from datetime import timedelta
 
 class HybridAnnealing:
     def __init__(self, bqm, qubo_matrix, qubo_obj, qubo_constraints, const_constraint, num_spin,
-                 N_I, N_E, N_S, sub_qubo_size, spin, client, name_to_index):
+                 N_I, N_E, N_S, sub_qubo_size, spin, client, name_to_index, flow, dist):
         self.bqm = bqm # model（QUBO式）
         self.qubo_matrix = qubo_matrix # QUBO行列
         self.qubo_obj = qubo_obj # QUBO行列（コスト項）
@@ -18,18 +18,19 @@ class HybridAnnealing:
         self.N_I = N_I # solution instances
         self.N_E = N_E # num of subQUBO
         self.N_S = N_S # num of select solution instamces(N_S < N_I )
-        self.client = client
+        self.client = client # Amplify client情報
         self.sub_qubo_size = sub_qubo_size # subQUBO size 
-        self.spin = spin # amplify spins
+        self.spin = spin # amplify形式の変数
         self.name_to_index = name_to_index
-        self.pool = self._initialize_pool() # solution instances pool(N_I)
+        self.flow = flow # QAP flow
+        self.dist = dist # QAP dist
+        self.pool = [] # solution instances pool(N_I)
          
         
 
     # プール初期化（Tabuサーチを使う版）
     def _initialize_pool(self):
         sampler = TabuSampler()
-        pool = []
         # Tabuサーチで連続N_I回サンプリング
         sampleset = sampler.sample(self.bqm, num_reads= self.N_I)
         # サンプルセットから N_I 個のサンプルを取得
@@ -42,7 +43,7 @@ class HybridAnnealing:
                 x[idx] = sample[var]
             energy_obj = Solution.energy(self.qubo_obj, x)
             energy_constraint = Solution.energy(qubo = self.qubo_matrix, x=x, const = self.const_constraint)
-            pool.append(
+            self.pool.append(
                 Solution(
                     x=x,
                     energy_all=energy_obj + energy_constraint,
@@ -51,7 +52,7 @@ class HybridAnnealing:
                     constraint=Solution.check_constraint(qubo = self.qubo_matrix, x=x, const=self.const_constraint)
                 )
             )
-        return pool
+        return self.pool
 
     # Amplify モデルと変数 q を取得して，解いた変数を返す   
     def _evaluate(self, model, spin):
@@ -60,58 +61,156 @@ class HybridAnnealing:
         return q_values
     
     # d-wave タブーサーチ
-    def _tabu_search(self, bqm):
+    def _tabu_search(self):
         sampler = TabuSampler()
-        sampleset = sampler.sample(bqm, num_reads=100)
-        return sampleset
+        new_pool = []
+        for sol in self.pool:
+            # Ocean BQMの変数名順にdictを生成
+            # bqm.variables: ['x_{i}_{j}', ...]
+            initial_state = {v: int(sol.x[idx]) for idx, v in enumerate(self.bqm.variables)}
+            # Tabuサーチを初期解から1回実行
+            sampleset = sampler.sample(self.bqm, initial_state=initial_state)
+            sample = sampleset.first.sample
+            # dict→1次元配列xに変換（変数名順）
+            x = np.array([sample[v] for v in self.bqm.variables], dtype=int)
+            energy_obj = Solution.energy(self.qubo_obj, x)
+            energy_constraint = Solution.energy(qubo=self.qubo_matrix, x=x, const=self.const_constraint)
+            new_pool.append(
+                Solution(
+                    x=x,
+                    energy_all=energy_obj + energy_constraint,
+                    energy_obj=energy_obj,
+                    energy_constraint=energy_constraint,
+                    constraint=Solution.check_constraint(qubo=self.qubo_constraints, x=x, const=self.const_constraint)
+                )
+            )
+        return new_pool
+
+    def _AE_subQUBO(self, sub_spin_idx, non_sub_spin_idx):
+        # Amplifyの変数生成
+        gen = VariableGenerator()
+        sub_q = gen.array("Binary", self.sub_qubo_size)
+                
+        # 目的関数（コスト）
+        cost = 0
+        N = self.flow.shape[0]
+        for i, idx_i in enumerate(sub_spin_idx):
+            i_fac, i_pos = divmod(idx_i, N)
+            for j, idx_j in enumerate(sub_spin_idx):
+                j_fac, j_pos = divmod(idx_j, N)
+                cost += self.flow[i_fac, j_fac] * self.dist[i_pos, j_pos] * sub_q[i] * sub_q[j]
+
+        # サブQUBO用 制約項 (サブQUBO内で同じ施設/場所が複数回現れる場合のみone-hot制約を課す)
+        fac_list = []
+        pos_list = []
+        constraint_terms = []
+        for fac in set(fac_list):
+            idxs = [i for i, f in enumerate(fac_list) if f == fac]
+            if len(idxs) > 1:
+                constraint_terms.append((sum(sub_q[i] for i in idxs) - 1) ** 2)
+        for pos in set(pos_list):
+            idxs = [i for i, p in enumerate(pos_list) if p == pos]
+            if len(idxs) > 1:
+                constraint_terms.append((sum(sub_q[i] for i in idxs) - 1) ** 2)
+        constraints = sum(constraint_terms) if constraint_terms else 0
+                
+        penalty = np.max(self.flow) * np.max(self.dist) * self.sub_qubo_size 
+        sub_model = cost + penalty * constraints
+                
+        
+        sub_result = solve(sub_model, self.client)
+        sub_best_sol = sub_result.best.values
+        sub_qubo_assignment = [sub_best_sol[sub_q[i]] for i in range(self.sub_qubo_size)]
+               
+        # 解インスタンスからランダムに解インスタンスを１つ選択 
+        X_t = random.choice(self.pool)
+                
+        # subQUBO と X_t を組み合わせた新たな解
+        new_X = np.zeros(self.num_spin, dtype = int)
+        for i, idx in enumerate(sub_spin_idx):
+            new_X[idx] = sub_qubo_assignment[i]
+                    
+        for idx in non_sub_spin_idx:
+            new_X[idx] = X_t.x[idx]
+                
+        energy_obj = Solution.energy(self.qubo_obj, new_X)
+        energy_constraint = Solution.energy(qubo=self.qubo_matrix, x=new_X, const=self.const_constraint)
+        new_sol = Solution(
+            x=new_X,
+            energy_all=energy_obj + energy_constraint,
+            energy_obj=energy_obj,
+            energy_constraint=energy_constraint,
+            constraint=Solution.check_constraint(qubo=self.qubo_matrix, x=new_X, const=self.const_constraint)
+        )
+        return new_sol
+    
+    
+    def count_qap_violations(self, x):
+        facility_violation = 0
+        location_violation = 0
+        N = self.flow.shape[0]
+
+        # 施設ごと
+        for i in range(N):
+            assigned = sum(x[i*N + p] for p in range(N))
+            if assigned != 1:
+                facility_violation += 1
+
+        # 場所ごと
+        for p in range(N):
+            assigned = sum(x[i*N + p] for i in range(N))
+            if assigned != 1:
+                location_violation += 1
+
+        return facility_violation, location_violation
+
 
     # メイン
     def run(self):
+        self.pool = self._initialize_pool()
+        
         # 一旦，１
         # 本来は，プール内の平均ハミング距離で判定
-        for epoch in range(1):
-            for i in range(self.N_I):
-                solution_tmp = Solution(self.num_spin)
-                solution_tmp.x = np.copy(self.pool[i].x)
-
-            # ランダムにサブQUBO選択
-            extracted_idx = sorted(random.sample(range(self.num_spin), self.sub_qubo_size))
-            non_extracted_idx = sorted(list(set(range(self.num_spin)) - set(extracted_idx)))
-
-            # サブQUBO作成
-            subqubo_obj = self.qubo_obj[np.ix_(extracted_idx, extracted_idx)]
-            for idx_i, val_i in enumerate(extracted_idx):
-                subqubo_obj[idx_i, idx_i] += sum(self.qubo_obj[val_i, j] * solution_tmp.x[j]
-                                                for j in non_extracted_idx)
-
-            subqubo_constraint = self.qubo_matrix[np.ix_(extracted_idx, extracted_idx)]
+        # Line 6 
+        for _ in range(1):
+            # Line 8
+            self.pool = self._tabu_search()
             
-            for idx_i, val_i in enumerate(extracted_idx):
-                subqubo_constraint[idx_i, idx_i] += sum(self.qubo_matrix[val_i, j] * solution_tmp.x[j]
-                                                        for j in non_extracted_idx)
-
-                const = self.const_constraint - sum(sum(self.qubo_matrix[i, j] * solution_tmp.x[i] * solution_tmp.x[j]
-                                                        for j in non_extracted_idx) for i in non_extracted_idx)
-
-                # Amplify用のModelを構築
-                gen = VariableGenerator()
-                matrix = gen.matrix("Binary", self.sub_qubo_size, self.sub_qubo_size)
-                q = matrix.variable_array
-                sub_model = sum(subqubo_obj[i, j] * q[i] * q[j] for i in range(self.sub_qubo_size) for j in range(self.sub_qubo_size))
-                sub_model += (sum(subqubo_constraint[i, j] * q[i] * q[j] for i in range(self.sub_qubo_size) for j in range(self.sub_qubo_size)) - const) ** 2
-
-                result = self.solve(sub_model, self.client)
-                if result.status.name != "SUCCESS":
-                    continue
-
-                values = result[0].values
-                for idx, var in enumerate(q):
-                    bit = values.get(var, 0)
-                    solution_tmp.x[extracted_idx[idx]] = bit
-
-                solution_tmp.energy = self._evaluate(solution_tmp.x)
-                if solution_tmp.energy < self.pool[i].energy:
-                    self.pool[i] = solution_tmp
-
-        best_solution = min(self.pool, key=lambda s: s.energy)
-        return best_solution.x, best_solution.energy
+            # 本来は，N_E
+            # Line 9
+            for i in range(self.N_E):
+            
+                # Line 10
+                # 解インスタンスを NS 個ランダムに選択
+                selected_pool = []
+                selected_pool = random.sample(self.pool, self.N_S)
+            
+                # 変数のばらつき
+                # Line 11~14
+                c = np.zeros(self.num_spin)
+                d = np.zeros(self.num_spin)
+            
+                for j in range(self.num_spin):
+                    for k in range(len(selected_pool)):
+                        c[j] += selected_pool[k].x[j]
+                    d[j] = abs(c[j] - self.N_S / 2)
+            
+                select_idx = np.argsort(d)
+                
+                sub_spin_idx = select_idx[:self.sub_qubo_size]
+                non_sub_spin_idx = select_idx[self.sub_qubo_size:]
+                
+                # サブQUBO を AE で解く
+                # Line 15
+                new_sol = self._AE_subQUBO(sub_spin_idx, non_sub_spin_idx)
+                
+                # Line 16
+                self.pool.append(new_sol)
+                
+            self.pool = sorted(self.pool, key=lambda sol: sol.energy_all)[:self.N_I]
+        
+        best_solution = min(self.pool, key=lambda sol: sol.energy_all)
+        facility_violation, location_violation = self.count_qap_violations(best_solution.x)
+        
+        
+        return facility_violation, location_violation, best_solution

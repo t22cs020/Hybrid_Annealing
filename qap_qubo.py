@@ -86,4 +86,4 @@ def create_qap_bqm(filepath, penalty=1000):
     #print("dist",dist)
     #print("qubo_matrix", qubo_matrix)
     
-    return bqm, q, model, N, qubo_matrix, qubo_constraints, qubo_obj, name_to_index
+    return bqm, q, model, N, qubo_matrix, qubo_constraints, qubo_obj, name_to_index, flow, dist
