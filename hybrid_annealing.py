@@ -7,10 +7,9 @@ from datetime import timedelta
 
 
 class HybridAnnealing:
-    def __init__(self, bqm, qubo_matrix, qubo_obj, qubo_constraints, const_constraint, num_spin,
-                 N_I, N_E, N_S, sub_qubo_size, spin, client, name_to_index, flow, dist):
-        self.bqm = bqm # model（QUBO式）
-        self.qubo_matrix = qubo_matrix # QUBO行列
+    def __init__(self, bqm, qubo_obj, qubo_constraints, const_constraint, num_spin,
+                 N_I, N_E, N_S, sub_qubo_size, client, flow, dist):
+        self.bqm = bqm
         self.qubo_obj = qubo_obj # QUBO行列（コスト項）
         self.qubo_constraints = qubo_constraints # QUBO行列（制約項）
         self.const_constraint = const_constraint # 制約定数
@@ -20,45 +19,30 @@ class HybridAnnealing:
         self.N_S = N_S # num of select solution instamces(N_S < N_I )
         self.client = client # Amplify client情報
         self.sub_qubo_size = sub_qubo_size # subQUBO size 
-        self.spin = spin # amplify形式の変数
-        self.name_to_index = name_to_index
         self.flow = flow # QAP flow
         self.dist = dist # QAP dist
         self.pool = [] # solution instances pool(N_I)
          
         
 
-    # プール初期化（Tabuサーチを使う版）
+    # プール初期化（ランダムに0,1を生成）
     def _initialize_pool(self):
-        sampler = TabuSampler()
-        # Tabuサーチで連続N_I回サンプリング
-        sampleset = sampler.sample(self.bqm, num_reads= self.N_I)
-        # サンプルセットから N_I 個のサンプルを取得
-        for sample in sampleset.samples():
-            # Ocean形式 {'x_{i}_{j}': 0/1, ...} から1次元配列xに変換 (変数ソート順を合わせる)
-            # name_to_index: {'x_{i}_{j}': (i, j)}
-            # num_spin = N*N
-            x = np.zeros(len(self.qubo_obj), dtype=int)
-            for idx, var in enumerate(sorted(sample.keys())):
-                x[idx] = sample[var]
+        self.pool = []
+        for _ in range(self.N_I):
+            # 0,1をランダムに生成
+            x = np.random.randint(0, 2, self.num_spin)
             energy_obj = Solution.energy(self.qubo_obj, x)
-            energy_constraint = Solution.energy(qubo = self.qubo_matrix, x=x, const = self.const_constraint)
+            energy_constraint = Solution.energy(self.qubo_constraints, x, self.const_constraint)
             self.pool.append(
                 Solution(
                     x=x,
                     energy_all=energy_obj + energy_constraint,
                     energy_obj=energy_obj,
                     energy_constraint=energy_constraint,
-                    constraint=Solution.check_constraint(qubo = self.qubo_matrix, x=x, const=self.const_constraint)
+                    constraint=Solution.check_constraint(self.qubo_constraints, x, self.const_constraint)
                 )
             )
         return self.pool
-
-    # Amplify モデルと変数 q を取得して，解いた変数を返す   
-    def _evaluate(self, model, spin):
-        result = solve(model, self.client)
-        q_values = spin.evaluate(result.best.values)
-        return q_values
     
     # d-wave タブーサーチ
     def _tabu_search(self):
@@ -74,7 +58,7 @@ class HybridAnnealing:
             # dict→1次元配列xに変換（変数名順）
             x = np.array([sample[v] for v in self.bqm.variables], dtype=int)
             energy_obj = Solution.energy(self.qubo_obj, x)
-            energy_constraint = Solution.energy(qubo=self.qubo_matrix, x=x, const=self.const_constraint)
+            energy_constraint = Solution.energy(qubo=self.qubo_constraints, x=x, const=self.const_constraint)
             new_pool.append(
                 Solution(
                     x=x,
@@ -103,6 +87,7 @@ class HybridAnnealing:
         # サブQUBO用 制約項 (サブQUBO内で同じ施設/場所が複数回現れる場合のみone-hot制約を課す)
         fac_list = []
         pos_list = []
+        
         constraint_terms = []
         for fac in set(fac_list):
             idxs = [i for i, f in enumerate(fac_list) if f == fac]
@@ -134,17 +119,17 @@ class HybridAnnealing:
             new_X[idx] = X_t.x[idx]
                 
         energy_obj = Solution.energy(self.qubo_obj, new_X)
-        energy_constraint = Solution.energy(qubo=self.qubo_matrix, x=new_X, const=self.const_constraint)
+        energy_constraint = Solution.energy(qubo=self.qubo_constraints, x=new_X, const=self.const_constraint)
         new_sol = Solution(
             x=new_X,
             energy_all=energy_obj + energy_constraint,
             energy_obj=energy_obj,
             energy_constraint=energy_constraint,
-            constraint=Solution.check_constraint(qubo=self.qubo_matrix, x=new_X, const=self.const_constraint)
+            constraint=Solution.check_constraint(qubo=self.qubo_constraints, x=new_X, const=self.const_constraint)
         )
         return new_sol
     
-    
+    # one-hot 制約の判定
     def count_qap_violations(self, x):
         facility_violation = 0
         location_violation = 0
@@ -163,16 +148,31 @@ class HybridAnnealing:
                 location_violation += 1
 
         return facility_violation, location_violation
+    
+    # プール内の解同士の平均ハミング距離を計算
+    def _average_hamming_distance(self, pool):
+        if len(pool) <= 1:
+            return 0
+        total = 0
+        count = 0
+        for i in range(len(pool)):
+            for j in range(i+1, len(pool)):
+                total += np.sum(pool[i].x != pool[j].x)
+                count += 1
+        return total / count if count > 0 else 0
 
 
     # メイン
     def run(self):
         self.pool = self._initialize_pool()
         
-        # 一旦，１
-        # 本来は，プール内の平均ハミング距離で判定
+        # プール内の平均ハミング距離で判定
         # Line 6 
-        for _ in range(1):
+        while True:
+            avg_hamming = self._average_hamming_distance(self.pool)
+            if avg_hamming < self.sub_qubo_size:
+                break
+            
             # Line 8
             self.pool = self._tabu_search()
             
@@ -209,8 +209,9 @@ class HybridAnnealing:
                 
             self.pool = sorted(self.pool, key=lambda sol: sol.energy_all)[:self.N_I]
         
+        # 最適解
         best_solution = min(self.pool, key=lambda sol: sol.energy_all)
+        # 制約違反数
         facility_violation, location_violation = self.count_qap_violations(best_solution.x)
-        
         
         return facility_violation, location_violation, best_solution

@@ -2,7 +2,7 @@ import numpy as np
 import dimod
 from amplify import VariableGenerator, Model, one_hot
 
-def create_qap_bqm(filepath, penalty=1000):
+def create_qap_bqm(filepath):
     # --- QAPLIBファイル読み込み ---
     with open(filepath, "r") as f:
         lines = [line for line in f.readlines() if line.strip()]
@@ -10,21 +10,12 @@ def create_qap_bqm(filepath, penalty=1000):
     flow = np.array([list(map(int, lines[i + 1].split())) for i in range(n)])
     dist = np.array([list(map(int, lines[i + 1 + n].split())) for i in range(n)])
     N = flow.shape[0]
+    penalty = np.max(dist) * np.max(flow) * (N - 1)
 
     # --- Amplify変数生成 ---
     gen = VariableGenerator()
     matrix = gen.matrix("Binary", N, N)
     q = matrix.variable_array
-
-    # --- 制約定義 (one-hot) ---
-    constraints = one_hot(q, axis=1) + one_hot(q, axis=0)
-    penalty_weight = np.max(dist) * np.max(flow) * (N - 1)
-    model = matrix + penalty_weight * constraints
-
-    # --- Poly取得 & QUBO変換 ---
-    poly = model.to_unconstrained_poly()
-    variables = poly.variables
-    qubo_dict = poly.as_dict()
 
     # --- Ocean SDK 用に変換 ---
     linear = {}
@@ -39,6 +30,52 @@ def create_qap_bqm(filepath, penalty=1000):
             name_to_index[var_str] = (i, j)
             index_to_name[(i, j)] = var_str
 
+    # --- QUBO行列生成 ---
+    qubo_matrix = np.zeros((N*N, N*N))
+    qubo_obj = np.zeros((N*N, N*N))
+    for i in range(N):
+        for j in range(N):
+            for k in range(N):
+                for l in range(N):
+                    qubo_obj[i*N + k, j*N + l] += flow[i, j] * dist[k, l]
+                    qubo_matrix[i*N + k, j*N + l] += flow[i, j] * dist[k, l]
+
+    # --- QUBO制約項（厳密なone-hot形式） ---
+    lam = penalty
+    qubo_constraints = np.zeros((N*N, N*N))
+    # 施設側
+    for i in range(N):
+        for k in range(N):
+            idx_ik = i * N + k
+            qubo_constraints[idx_ik, idx_ik] += lam * (-2)
+            for l in range(N):
+                idx_il = i * N + l
+                qubo_constraints[idx_ik, idx_il] += lam
+    # 場所側
+    for k in range(N):
+        for i in range(N):
+            idx_ik = i * N + k
+            qubo_constraints[idx_ik, idx_ik] += lam * (-2)
+            for j in range(N):
+                idx_jk = j * N + k
+                qubo_constraints[idx_ik, idx_jk] += lam
+
+    # --- 定数項（違反ゼロならenergy_constraint=0になるよう）
+    const_constraint = lam * N * 2
+
+    # --- 目的項＋制約項の合成QUBO行列 ---
+    qubo_matrix = qubo_obj + qubo_constraints
+
+    # --- Amplifyモデル・BQM作成 ---
+    constraints = one_hot(q, axis=1) + one_hot(q, axis=0)
+    penalty_weight = lam
+    model = matrix + penalty_weight * constraints
+    poly = model.to_unconstrained_poly()
+    variables = poly.variables
+    qubo_dict = poly.as_dict()
+
+    linear = {}
+    quadratic = {}
     for key, coeff in qubo_dict.items():
         if len(key) == 1:
             name = str(variables[key[0]])
@@ -49,41 +86,6 @@ def create_qap_bqm(filepath, penalty=1000):
             pair = tuple(sorted((name1, name2)))
             quadratic[pair] = quadratic.get(pair, 0) + coeff
 
-    # --- QUBO行列生成 ---
-    qubo_matrix = np.zeros((n*n, n*n))
-    qubo_obj = np.zeros((n*n, n*n))
-    for i in range(n):
-        for j in range(n):
-            for k in range(n):
-                for l in range(n):
-                    qubo_obj[i*n + k, j*n + l] += flow[i, j] * dist[k, l]
-                    qubo_matrix[i*n + k, j*n + l] += flow[i, j] * dist[k, l]
-
-    qubo_constraints = np.zeros((n*n, n*n))
-    # 施設ごとの one-hot
-    for i in range(n):
-        for k in range(n):
-            qubo_constraints[i*n + k, i*n + k] += -2 * penalty_weight
-            qubo_matrix[i*n + k, i*n + k] += -2 * penalty_weight
-            for l in range(k + 1, n):
-                qubo_constraints[i*n + k, i*n + l] += 2 * penalty_weight
-                qubo_matrix[i*n + k, i*n + l] += 2 * penalty_weight
-
-    # 場所ごとの one-hot
-    for k in range(n):
-        for i in range(n):
-            qubo_constraints[i*n + k, i*n + k] += -2 * penalty_weight
-            qubo_matrix[i*n + k, i*n + k] += -2 * penalty_weight
-            for j in range(i + 1, n):
-                qubo_constraints[i*n + k, j*n + k] += 2 * penalty_weight
-                qubo_matrix[i*n + k, j*n + k] += 2 * penalty_weight
-
-    # --- BQM作成 ---
     bqm = dimod.BinaryQuadraticModel(linear, quadratic, 0.0, dimod.BINARY)
 
-    # デバック用
-    #print("flow",flow)
-    #print("dist",dist)
-    #print("qubo_matrix", qubo_matrix)
-    
-    return bqm, q, model, N, qubo_matrix, qubo_constraints, qubo_obj, name_to_index, flow, dist
+    return bqm, model, qubo_constraints, qubo_obj, flow, dist, const_constraint
