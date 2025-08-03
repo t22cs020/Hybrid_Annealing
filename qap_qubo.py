@@ -17,28 +17,13 @@ def create_qap_bqm(filepath):
     matrix = gen.matrix("Binary", N, N)
     q = matrix.variable_array
 
-    # --- Ocean SDK 用に変換 ---
-    linear = {}
-    quadratic = {}
-    name_to_index = {}  # 変数名 -> (i,j)
-    index_to_name = {}  # (i,j) -> 変数名
-
-    for i in range(N):
-        for j in range(N):
-            var = q[i][j]
-            var_str = str(var)
-            name_to_index[var_str] = (i, j)
-            index_to_name[(i, j)] = var_str
-
     # --- QUBO行列生成 ---
-    qubo_matrix = np.zeros((N*N, N*N))
     qubo_obj = np.zeros((N*N, N*N))
     for i in range(N):
         for j in range(N):
             for k in range(N):
                 for l in range(N):
                     qubo_obj[i*N + k, j*N + l] += flow[i, j] * dist[k, l]
-                    qubo_matrix[i*N + k, j*N + l] += flow[i, j] * dist[k, l]
 
     # --- QUBO制約項（厳密なone-hot形式） ---
     lam = penalty
@@ -60,11 +45,8 @@ def create_qap_bqm(filepath):
                 idx_jk = j * N + k
                 qubo_constraints[idx_ik, idx_jk] += lam
 
-    # --- 定数項（違反ゼロならenergy_constraint=0になるよう）
+    # --- 定数項（違反ゼロならenergy_constraint=0）
     const_constraint = lam * N * 2
-
-    # --- 目的項＋制約項の合成QUBO行列 ---
-    qubo_matrix = qubo_obj + qubo_constraints
 
     # --- Amplifyモデル・BQM作成 ---
     constraints = one_hot(q, axis=1) + one_hot(q, axis=0)
@@ -88,4 +70,12 @@ def create_qap_bqm(filepath):
 
     bqm = dimod.BinaryQuadraticModel(linear, quadratic, 0.0, dimod.BINARY)
 
-    return bqm, model, qubo_constraints, qubo_obj, flow, dist, const_constraint
+    
+    return (bqm, 
+            model, 
+            qubo_constraints, 
+            qubo_obj, 
+            flow, 
+            dist, 
+            const_constraint
+            )
